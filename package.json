@@ -2,9 +2,7 @@
   "name": "ev-range-stitcher",
   "version": "1.0.0",
   "type": "module",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
     "@turf/turf": "6.5.0",
     "dotenv": "16.4.5",
@@ -12,6 +10,6 @@
     "node-cache": "5.1.2",
     "p-limit": "4.0.0",
     "undici": "6.19.8",
-    "@here/flexpolyline": "1.1.1"
+    "@here/flexpolyline": "1.1.0"     // ← change from 1.1.1 to 1.1.0
   }
 }
