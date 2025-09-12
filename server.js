@@ -34,34 +34,44 @@ function herePolyToFeatures(isoline) {
   const features = [];
 
   function normalizeOuter(outer) {
-    // Case A: already an array
+    // A) Array
     if (Array.isArray(outer)) {
-      if (outer.length === 0) return [];
-      // A1: array of objects {lat, lng}
-      if (typeof outer[0] === 'object' && ('lat' in outer[0] || 'lng' in outer[0])) {
+      if (!outer.length) return [];
+      // A1) [{lat, lng}, ...]
+      if (typeof outer[0] === 'object' && (('lat' in outer[0]) || ('lng' in outer[0]))) {
         return outer.map(pt => [Number(pt.lng), Number(pt.lat)]);
       }
-      // A2: array of coordinate pairs [lng, lat]
+      // A2) [[lng, lat], ...]
       if (Array.isArray(outer[0])) {
         return outer.map(pair => [Number(pair[0]), Number(pair[1])]);
       }
     }
 
-    // Case B: GeoJSON-like line: { type: "LineString", coordinates: [...] }
+    // B) GeoJSON-like line object
     if (outer && typeof outer === 'object' && outer.type === 'LineString' && Array.isArray(outer.coordinates)) {
-      const coords = outer.coordinates;
-      if (!coords.length) return [];
-      if (Array.isArray(coords[0])) {
+      const c = outer.coordinates;
+      if (!c.length) return [];
+      if (Array.isArray(c[0])) {
         // [[lng,lat], ...]
-        return coords.map(pair => [Number(pair[0]), Number(pair[1])]);
+        return c.map(pair => [Number(pair[0]), Number(pair[1])]);
       }
       // [{lat, lng}, ...]
-      if (typeof coords[0] === 'object' && ('lat' in coords[0] || 'lng' in coords[0])) {
-        return coords.map(pt => [Number(pt.lng), Number(pt.lat)]);
+      if (typeof c[0] === 'object' && (('lat' in c[0]) || ('lng' in c[0]))) {
+        return c.map(pt => [Number(pt.lng), Number(pt.lat)]);
       }
     }
 
-    // Unknown shape
+    // C) HERE flexible polyline string
+    if (typeof outer === 'string') {
+      try {
+        // decode returns [ [lat,lng], [lat,lng], ... ]
+        const coords = decode(outer);
+        return coords.map(([lat, lng]) => [Number(lng), Number(lat)]);
+      } catch {
+        return [];
+      }
+    }
+
     return [];
   }
 
@@ -70,9 +80,9 @@ function herePolyToFeatures(isoline) {
     if (!ring.length) continue;
 
     // ensure closed ring
-    const first = ring[0];
-    const last = ring[ring.length - 1];
-    if (first[0] !== last[0] || first[1] !== last[1]) ring.push(first);
+    const [fx, fy] = ring[0];
+    const [lx, ly] = ring[ring.length - 1];
+    if (fx !== lx || fy !== ly) ring.push([fx, fy]);
 
     features.push(turf.polygon([ring], {}));
   }
