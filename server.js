@@ -1,4 +1,4 @@
-import { decode } from '@here/flexpolyline';
+import { decode } from 'flexible-polyline';
 import 'dotenv/config';
 import express from 'express';
 import { fetch } from 'undici';
