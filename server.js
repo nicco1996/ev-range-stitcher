@@ -29,16 +29,54 @@ function cacheKey(lat, lng, miles, mode = 'car') {
 }
 
 function herePolyToFeatures(isoline) {
-  const polys = isoline.polygons || [];
-  const feats = polys.map(p => {
-    const outer = p.outer || [];
-    const ring = outer.map(pt => [pt.lng, pt.lat]);
-    if (ring.length && (ring[0][0] !== ring[ring.length - 1][0] || ring[0][1] !== ring[ring.length - 1][1])) {
-      ring.push(ring[0]);
+  const polys = isoline?.polygons || [];
+  const features = [];
+
+  function normalizeOuter(outer) {
+    // Case A: already an array
+    if (Array.isArray(outer)) {
+      if (outer.length === 0) return [];
+      // A1: array of objects {lat, lng}
+      if (typeof outer[0] === 'object' && ('lat' in outer[0] || 'lng' in outer[0])) {
+        return outer.map(pt => [Number(pt.lng), Number(pt.lat)]);
+      }
+      // A2: array of coordinate pairs [lng, lat]
+      if (Array.isArray(outer[0])) {
+        return outer.map(pair => [Number(pair[0]), Number(pair[1])]);
+      }
     }
-    return turf.polygon([ring], {});
-  });
-  return feats;
+
+    // Case B: GeoJSON-like line: { type: "LineString", coordinates: [...] }
+    if (outer && typeof outer === 'object' && outer.type === 'LineString' && Array.isArray(outer.coordinates)) {
+      const coords = outer.coordinates;
+      if (!coords.length) return [];
+      if (Array.isArray(coords[0])) {
+        // [[lng,lat], ...]
+        return coords.map(pair => [Number(pair[0]), Number(pair[1])]);
+      }
+      // [{lat, lng}, ...]
+      if (typeof coords[0] === 'object' && ('lat' in coords[0] || 'lng' in coords[0])) {
+        return coords.map(pt => [Number(pt.lng), Number(pt.lat)]);
+      }
+    }
+
+    // Unknown shape
+    return [];
+  }
+
+  for (const p of polys) {
+    const ring = normalizeOuter(p.outer);
+    if (!ring.length) continue;
+
+    // ensure closed ring
+    const first = ring[0];
+    const last = ring[ring.length - 1];
+    if (first[0] !== last[0] || first[1] !== last[1]) ring.push(first);
+
+    features.push(turf.polygon([ring], {}));
+  }
+
+  return features;
 }
 
 async function fetchIsoline(lat, lng, stepMeters) {
