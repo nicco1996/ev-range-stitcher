@@ -1,4 +1,3 @@
-import { decode } from 'flexible-polyline';
 import 'dotenv/config';
 import express from 'express';
 import { fetch } from 'undici';
@@ -11,7 +10,7 @@ const PORT = process.env.PORT || 3000;
 const HERE_KEY = process.env.HERE_API_KEY;
 const MAX_CONCURRENCY = Number(process.env.MAX_CONCURRENCY || 20);
 
-// ---- CORS so Bubble can call this from the browser ----
+// ---------------- CORS (allow Bubble/frontend) ----------------
 app.use((req, res, next) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Methods', 'GET,OPTIONS');
@@ -20,10 +19,54 @@ app.use((req, res, next) => {
   next();
 });
 
-// In-memory cache (swap for Redis later)
-const cache = new NodeCache({ stdTTL: 60 * 60 * 24, useClones: false }); // 24h
+// ---------------- In-memory cache (24h) -----------------------
+const cache = new NodeCache({ stdTTL: 60 * 60 * 24, useClones: false });
 
-// Helpers ---------------------------------------------------------
+// ---------------- Minimal HERE Flex-Polyline decoder ----------
+/** Spec: https://github.com/heremaps/flexible-polyline
+ *  Returns: [ [lat,lng(,z?)], ... ] */
+function decodeFlexPolyline(str) {
+  let index = 0;
+
+  const decodeUnsignedVarint = () => {
+    let result = 0, shift = 0, b;
+    do {
+      b = str.charCodeAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    return result;
+  };
+  const decodeSignedVarint = () => {
+    const u = decodeUnsignedVarint();
+    return (u & 1) ? ~(u >> 1) : (u >> 1);
+  };
+
+  const precision = decodeUnsignedVarint();
+  const thirdDim = decodeUnsignedVarint();
+  const thirdDimPrecision = decodeUnsignedVarint();
+
+  const factor = Math.pow(10, precision);
+  const thirdFactor = Math.pow(10, thirdDimPrecision);
+  const hasZ = thirdDim !== 0;
+
+  let lastLat = 0, lastLng = 0, lastZ = 0;
+  const coords = [];
+
+  while (index < str.length) {
+    lastLat += decodeSignedVarint();
+    lastLng += decodeSignedVarint();
+    const rec = [lastLat / factor, lastLng / factor];
+    if (hasZ) {
+      lastZ += decodeSignedVarint();
+      rec.push(lastZ / thirdFactor);
+    }
+    coords.push(rec);
+  }
+  return coords;
+}
+
+// ---------------- Helpers ------------------------------------
 function snap(val, gridDeg = 0.1) { return Math.round(val / gridDeg) * gridDeg; }
 function cacheKey(lat, lng, miles, mode = 'car') {
   return `${snap(lat)},${snap(lng)}:${Math.round(miles)}:${mode}`;
@@ -37,11 +80,11 @@ function herePolyToFeatures(isoline) {
     // A) Array
     if (Array.isArray(outer)) {
       if (!outer.length) return [];
-      // A1) [{lat, lng}, ...]
+      // A1) [{lat,lng}, ...]
       if (typeof outer[0] === 'object' && (('lat' in outer[0]) || ('lng' in outer[0]))) {
         return outer.map(pt => [Number(pt.lng), Number(pt.lat)]);
       }
-      // A2) [[lng, lat], ...]
+      // A2) [[lng,lat], ...]
       if (Array.isArray(outer[0])) {
         return outer.map(pair => [Number(pair[0]), Number(pair[1])]);
       }
@@ -52,10 +95,8 @@ function herePolyToFeatures(isoline) {
       const c = outer.coordinates;
       if (!c.length) return [];
       if (Array.isArray(c[0])) {
-        // [[lng,lat], ...]
-        return c.map(pair => [Number(pair[0]), Number(pair[1])]);
+        return c.map(pair => [Number(pair[0]), Number(pair[1])]); // [[lng,lat],...]
       }
-      // [{lat, lng}, ...]
       if (typeof c[0] === 'object' && (('lat' in c[0]) || ('lng' in c[0]))) {
         return c.map(pt => [Number(pt.lng), Number(pt.lat)]);
       }
@@ -64,8 +105,7 @@ function herePolyToFeatures(isoline) {
     // C) HERE flexible polyline string
     if (typeof outer === 'string') {
       try {
-        // decode returns [ [lat,lng], [lat,lng], ... ]
-        const coords = decode(outer);
+        const coords = decodeFlexPolyline(outer); // [ [lat,lng,(z?)], ... ]
         return coords.map(([lat, lng]) => [Number(lng), Number(lat)]);
       } catch {
         return [];
@@ -127,16 +167,17 @@ function unionAll(features) {
   for (let i = 1; i < features.length; i++) {
     try { out = turf.union(out, features[i]) || out; }
     catch {
+      // fallback if union fails
       out = turf.combine(turf.featureCollection([out, features[i]])).features[0];
     }
   }
   return out;
 }
 
-// Core stitcher ---------------------------------------------------
+// --------------- Core stitcher (rings of ~100 km) ---------------
 async function computeStitchedPolygon(lat, lng, targetMiles) {
   const targetKm = targetMiles * 1.60934;
-  const STEP_KM = 100; // HERE distance ceiling per call
+  const STEP_KM = 100; // HERE max distance per call
   const stepMeters = Math.round(STEP_KM * 1000);
   const iters = Math.max(1, Math.ceil(targetKm / STEP_KM));
 
@@ -184,7 +225,7 @@ async function computeStitchedPolygon(lat, lng, targetMiles) {
   return smooth;
 }
 
-// API -------------------------------------------------------------
+// ---------------------- API routes -----------------------------
 app.get('/range', async (req, res) => {
   try {
     const lat = Number(req.query.lat);
@@ -195,19 +236,17 @@ app.get('/range', async (req, res) => {
       return res.status(400).json({ error: 'lat,lng,miles required' });
     }
 
-    // cache lookup
     const key = cacheKey(lat, lng, miles);
     const hit = cache.get(key);
     if (hit) return res.json({ cached: true, geojson: hit });
 
-    // protect quotas a little
     const safeMiles = Math.min(miles, 450);
 
     const t0 = Date.now();
     const feature = await computeStitchedPolygon(lat, lng, safeMiles);
     const ms = Date.now() - t0;
 
-    cache.set(key, feature, 60 * 60 * 24); // 24h TTL
+    cache.set(key, feature, 60 * 60 * 24); // 24h
     res.json({ cached: false, ms, geojson: feature });
   } catch (e) {
     console.error('ERROR /range', e);
