@@ -1,3 +1,4 @@
+// server.js
 import 'dotenv/config';
 import express from 'express';
 import { fetch } from 'undici';
@@ -7,11 +8,12 @@ import * as turf from '@turf/turf';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const HERE_KEY = process.env.HERE_API_KEY;
-const MAX_CONCURRENCY = Number(process.env.MAX_CONCURRENCY || 18);
-const DEBUG = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
 
-// ---------------- CORS ----------------
+const HERE_KEY = process.env.HERE_API_KEY;
+const LAND_URL = process.env.LAND_URL;           // <= ADD THIS in Render env
+const MAX_CONCURRENCY = Number(process.env.MAX_CONCURRENCY || 20);
+
+// ---- CORS so Bubble can call this from the browser ----
 app.use((req, res, next) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Methods', 'GET,OPTIONS');
@@ -20,113 +22,129 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------------- Cache (24h) --------
-const cache = new NodeCache({ stdTTL: 60 * 60 * 24, useClones: false });
+// In-memory cache (swap for Redis later)
+const cache = new NodeCache({ stdTTL: 60 * 60 * 24, useClones: false }); // 24h
 
-// Minimal flexible-polyline decoder (no external package)
-function decodeFlexPolyline(str) {
-  if (typeof str !== 'string' || !str.length) return [];
-  let i = 0;
-  const uvar = () => {
-    let res = 0, shift = 0, b;
-    do {
-      b = str.charCodeAt(i++) - 63;
-      res |= (b & 0x1f) << shift;
-      shift += 5;
-    } while (b >= 0x20);
-    return res;
-  };
-  const svar = () => {
-    const u = uvar();
-    return (u & 1) ? ~(u >> 1) : (u >> 1);
-  };
+/* ------------------------------------------------------------------ *
+ * LAND MASK LOADING
+ * We fetch your land multipolygon once at boot and keep it in memory.
+ * It can be: FeatureCollection | Feature | GeometryCollection
+ * ------------------------------------------------------------------ */
+let LAND_FEATURE = null;
 
-  const precision = uvar();
-  const thirdDim = uvar();
-  const thirdPrec = uvar();
+async function loadLandMask() {
+  if (!LAND_URL) throw new Error('Missing LAND_URL env var');
+  const r = await fetch(LAND_URL, { cache: 'no-store' });
+  if (!r.ok) throw new Error(`Failed to fetch LAND_URL: ${r.status}`);
+  const gj = await r.json();
 
-  const factor = Math.pow(10, precision);
-  const thirdFactor = Math.pow(10, thirdPrec);
-  const hasZ = thirdDim !== 0;
-
-  let lat = 0, lng = 0, z = 0;
-  const out = [];
-  while (i < str.length) {
-    lat += svar();
-    lng += svar();
-    const rec = [lat / factor, lng / factor];
-    if (hasZ) { z += svar(); rec.push(z / thirdFactor); }
-    out.push(rec);
+  // Normalize to one (Multi)Polygon feature
+  let features = [];
+  if (gj.type === 'FeatureCollection') {
+    features = gj.features.filter(f => !!f.geometry);
+  } else if (gj.type === 'GeometryCollection') {
+    features = gj.geometries.map(g => turf.feature(g));
+  } else if (gj.type === 'Feature' && gj.geometry) {
+    features = [gj];
+  } else if (gj.type) {
+    features = [turf.feature(gj)];
   }
-  return out; // [[lat,lng,(z)]...]
+
+  if (!features.length) throw new Error('LAND_URL contained no geometries');
+
+  // Dissolve to one feature
+  let merged = features[0];
+  for (let i = 1; i < features.length; i++) {
+    try { merged = turf.union(merged, features[i]) || merged; }
+    catch { merged = turf.combine(turf.featureCollection([merged, features[i]])).features[0]; }
+  }
+
+  LAND_FEATURE = merged;
+  console.log('[LAND] mask ready → type:', LAND_FEATURE.geometry.type);
 }
 
+function isOnLand(lat, lng) {
+  if (!LAND_FEATURE) return true; // fail open
+  const pt = turf.point([lng, lat]);
+  try { return turf.booleanPointInPolygon(pt, LAND_FEATURE); }
+  catch { return true; }
+}
+
+/* Move point toward center in small steps until it is on land (or we give up) */
+function movePointInland(lat, lng, centerLat, centerLng) {
+  if (isOnLand(lat, lng)) return { lat, lng };
+
+  const start = turf.point([lng, lat]);
+  const center = turf.point([centerLng, centerLat]);
+
+  const bearingToCenter = turf.bearing(start, center);
+  // Try increasing steps up to ~60 km
+  const stepsKm = [1, 2, 3, 5, 8, 13, 21, 34, 55, 60];
+
+  for (const d of stepsKm) {
+    const dest = turf.destination(start, d, bearingToCenter, { units: 'kilometers' });
+    const [x, y] = dest.geometry.coordinates;
+    if (isOnLand(y, x)) return { lat: y, lng: x };
+  }
+
+  // Plan B: also try perpendicular nudges (±90°) a bit
+  for (const side of [-90, +90]) {
+    for (const d of [2, 5, 10, 20, 40, 60]) {
+      const dest = turf.destination(start, d, bearingToCenter + side, { units: 'kilometers' });
+      const [x, y] = dest.geometry.coordinates;
+      if (isOnLand(y, x)) return { lat: y, lng: x };
+    }
+  }
+
+  // Give up – return original (HERE may still reject it)
+  return { lat, lng };
+}
+
+/* ------------------------------------------------------------------ *
+ * HELPERS
+ * ------------------------------------------------------------------ */
 function snap(val, gridDeg = 0.1) { return Math.round(val / gridDeg) * gridDeg; }
 function cacheKey(lat, lng, miles, mode = 'car') {
   return `${snap(lat)},${snap(lng)}:${Math.round(miles)}:${mode}`;
 }
 
-// Robust extractor: collect any polygon ring in the HERE payload
-function hereResponseToFeatures(data) {
-  const features = [];
+/* HERE → extract polygons into Turf features regardless of format */
+function herePolyToFeatures(isoline) {
+  const polys = isoline?.polygons || [];
+  const out = [];
 
-  const normalizeOuter = (outer) => {
+  for (const p of polys) {
+    const outer = p.outer;
+    let ring = [];
+
+    // 1) Array of points
     if (Array.isArray(outer)) {
-      if (!outer.length) return [];
-      if (typeof outer[0] === 'object' && outer[0] &&
-          (('lat' in outer[0]) || ('lng' in outer[0]))) {
-        return outer.map(pt => [Number(pt.lng), Number(pt.lat)]);
-      }
-      if (Array.isArray(outer[0])) {
-        return outer.map(pair => [Number(pair[0]), Number(pair[1])]);
-      }
-    }
-    if (outer && typeof outer === 'object' &&
-        outer.type === 'LineString' &&
-        Array.isArray(outer.coordinates)) {
-      const c = outer.coordinates;
-      if (!Array.isArray(c) || !c.length) return [];
-      if (Array.isArray(c[0])) return c.map(p => [Number(p[0]), Number(p[1])]);
-      if (typeof c[0] === 'object' && c[0] && (('lat' in c[0]) || ('lng' in c[0]))) {
-        return c.map(pt => [Number(pt.lng), Number(pt.lat)]);
+      if (outer.length) {
+        if (typeof outer[0] === 'object' && ('lat' in outer[0] || 'lng' in outer[0])) {
+          ring = outer.map(pt => [Number(pt.lng), Number(pt.lat)]);
+        } else if (Array.isArray(outer[0])) {
+          ring = outer.map(pair => [Number(pair[0]), Number(pair[1])]);
+        }
       }
     }
-    if (typeof outer === 'string') {
-      try {
-        const coords = decodeFlexPolyline(outer); // [[lat,lng,(z)]...]
-        return coords.map(([la, ln]) => [Number(ln), Number(la)]);
-      } catch {}
-    }
-    return [];
-  };
 
-  const ringToPolygon = (ring) => {
-    if (!Array.isArray(ring) || ring.length < 3) return null;
+    // 2) GeoJSON-like LineString
+    if (!ring.length && outer && typeof outer === 'object' &&
+        outer.type === 'LineString' && Array.isArray(outer.coordinates)) {
+      ring = outer.coordinates.map(([x, y]) => [Number(x), Number(y)]);
+    }
+
+    if (!ring.length) continue;
+
+    // ensure closed ring
     const [fx, fy] = ring[0];
     const [lx, ly] = ring[ring.length - 1];
-    if (fx !== lx || fy !== ly) ring = [...ring, [fx, fy]];
-    try { return turf.polygon([ring], {}); }
-    catch { return null; }
-  };
+    if (fx !== lx || fy !== ly) ring.push([fx, fy]);
 
-  const dfs = (obj) => {
-    if (!obj || typeof obj !== 'object') return;
-    if ('outer' in obj) {
-      const ring = normalizeOuter(obj.outer);
-      const poly = ringToPolygon(ring);
-      if (poly) features.push(poly);
-    }
-    if (Array.isArray(obj.polygons)) for (const it of obj.polygons) dfs(it);
-    for (const k of Object.keys(obj)) {
-      const v = obj[k];
-      if (Array.isArray(v)) for (const x of v) dfs(x);
-      else if (v && typeof v === 'object') dfs(v);
-    }
-  };
+    out.push(turf.polygon([ring]));
+  }
 
-  dfs(data);
-  if (DEBUG) console.log(`[EXTRACTOR] features found: ${features.length}`);
-  return features;
+  return out;
 }
 
 async function fetchIsoline(lat, lng, stepMeters) {
@@ -138,153 +156,108 @@ async function fetchIsoline(lat, lng, stepMeters) {
   url.searchParams.set('transportMode', 'car');
 
   const res = await fetch(url);
-  const txt = await res.text();
-  if (!res.ok) throw new Error(`HERE isoline ${res.status}: ${txt}`);
-
-  let data = {};
-  try { data = JSON.parse(txt); } catch { data = {}; }
-
-  if (DEBUG) {
-    const iso0 = data?.isolines?.[0];
-    console.log('[HERE] keys:', Object.keys(data || {}));
-    if (iso0) console.log('[HERE] isolines[0] keys:', Object.keys(iso0));
-  }
+  if (!res.ok) throw new Error(`HERE ${res.status} ${await res.text()}`);
+  const data = await res.json();
   return data;
 }
 
-function sampleBoundary(feature, n = 60) {
-  try {
-    const line = turf.polygonToLine(feature);
-    const length = turf.length(line, { units: 'kilometers' });
-    const step = Math.max(length / n, 0.001);
-    const pts = [];
-    for (let i = 0; i < n; i++) {
-      const p = turf.along(line, i * step, { units: 'kilometers' });
-      const [x, y] = p.geometry.coordinates;
-      pts.push({ lat: y, lng: x });
-    }
-    return pts;
-  } catch {
-    const b = turf.bbox(feature);
-    const [minX, minY, maxX, maxY] = b;
-    return [
-      { lat: minY, lng: minX }, { lat: minY, lng: maxX },
-      { lat: maxY, lng: maxX }, { lat: maxY, lng: minX }
-    ];
-  }
-}
-
 function unionAll(features) {
-  if (!features || !features.length) return null;
+  if (!features.length) return null;
   let out = features[0];
   for (let i = 1; i < features.length; i++) {
     try { out = turf.union(out, features[i]) || out; }
-    catch {
-      try { out = turf.combine(turf.featureCollection([out, features[i]])).features[0]; }
-      catch {}
-    }
+    catch { out = turf.combine(turf.featureCollection([out, features[i]])).features[0]; }
   }
   return out;
 }
 
-// ----------- geometry helpers -----------
-function nudgeToward(lat, lng, centerLat, centerLng, km = 3) {
-  const from = turf.point([lng, lat]);
-  const to = turf.point([centerLng, centerLat]);
-  const bearing = turf.bearing(from, to);
-  const dest = turf.destination(from, km, bearing, { units: 'kilometers' });
-  const [nx, ny] = dest.geometry.coordinates;
-  return { lat: ny, lng: nx };
-}
-
-// Try HERE multiple times per seed with increasing inland distances
-async function isolineFromSeedWithRetries(seed, center, stepMeters) {
-  const attemptsKm = [0, 3, 6, 10, 15, 25]; // 0 = as-is, then stronger nudges
-  for (const km of attemptsKm) {
-    const p = km === 0 ? seed : nudgeToward(seed.lat, seed.lng, center.lat, center.lng, km);
-    try {
-      const data = await fetchIsoline(p.lat, p.lng, stepMeters);
-      const feats = hereResponseToFeatures(data);
-      if (feats.length) return feats;
-      if (DEBUG && data?.notices?.length) {
-        console.log('[SEED NOTICE]', km, JSON.stringify(data.notices).slice(0, 200));
-      }
-    } catch (e) {
-      if (DEBUG) console.log('[SEED FAIL]', km, e.message);
-    }
+function sampleBoundary(feature, n = 80) {
+  const line = turf.polygonToLine(feature);
+  const length = turf.length(line, { units: 'kilometers' });
+  const step = length / n;
+  const pts = [];
+  for (let i = 0; i < n; i++) {
+    const p = turf.along(line, i * step, { units: 'kilometers' });
+    const [x, y] = p.geometry.coordinates;
+    pts.push({ lat: y, lng: x });
   }
-  return []; // all attempts failed
+  return pts;
 }
 
-// --------------- Stitcher ----------------
+/* ------------------------------------------------------------------ *
+ * CORE STITCHER (with inland seeding)
+ * ------------------------------------------------------------------ */
 async function computeStitchedPolygon(lat, lng, targetMiles) {
   const targetKm = targetMiles * 1.60934;
-  const STEP_KM = 100;
+  const STEP_KM = 100;                       // HERE distance ceiling per call
   const stepMeters = Math.round(STEP_KM * 1000);
-  const iters = Math.max(1, Math.ceil(targetKm / STEP_KM));
+  const rings = Math.max(1, Math.ceil(targetKm / STEP_KM));
 
   let seeds = [{ lat, lng }];
   let merged = null;
 
   const limit = pLimit(MAX_CONCURRENCY);
 
-  for (let ring = 0; ring < iters; ring++) {
-    // Evaluate all seeds with retry nudges
-    const centroidSeed = { lat: lat, lng: lng }; // fallback center if not merged yet
-    const centerPt = merged
-      ? (() => {
-          const [clng, clat] = turf.center(merged).geometry.coordinates;
-          return { lat: clat, lng: clng };
-        })()
-      : centroidSeed;
+  for (let ring = 0; ring < rings; ring++) {
+    // Snap all seeds onto land before calling HERE
+    const inlandSeeds = seeds.map(s => movePointInland(s.lat, s.lng, lat, lng));
 
-    const jobs = seeds.map(s => limit(() => isolineFromSeedWithRetries(s, centerPt, stepMeters)));
+    const jobs = inlandSeeds.map(s => limit(async () => {
+      const data = await fetchIsoline(s.lat, s.lng, stepMeters);
+
+      if (!data.isolines || !data.isolines.length) {
+        // log to help diagnose quota/network issues
+        if (data.notices) {
+          console.warn('[SEED NOTICE]', ring, JSON.stringify(data.notices));
+        }
+        return [];
+      }
+
+      const feats = herePolyToFeatures(data.isolines[0]);
+      return feats;
+    }));
+
     const results = await Promise.allSettled(jobs);
-
     const feats = [];
     for (const r of results) {
-      if (r.status === 'fulfilled' && r.value?.length) feats.push(...r.value);
+      if (r.status === 'fulfilled') feats.push(...r.value);
     }
-    if (!feats.length) {
-      if (DEBUG) {
-        const ok = results.find(r => r.status === 'fulfilled')?.value;
-        console.log('[NO POLYS] all seeds failed on this ring');
-      }
-      throw new Error('No polygons from HERE at this ring');
-    }
+
+    if (!feats.length) throw new Error('No polygons from HERE at this ring');
 
     merged = merged ? unionAll([merged, ...feats]) : unionAll(feats);
-    try { merged = turf.simplify(merged, { tolerance: 0.01, highQuality: true }); } catch {}
+    merged = turf.simplify(merged, { tolerance: 0.01, highQuality: true });
 
-    // Next seeds from boundary; de-dup coarse; fewer seeds to reduce calls
-    const boundarySeeds = sampleBoundary(merged, 60);
-    const seen = new Set();
-    const nextSeeds = [];
+    const boundarySeeds = sampleBoundary(merged, 80);
+    const seen = new Set(); const nextSeeds = [];
     for (const p of boundarySeeds) {
-      const k = `${Math.round(p.lat * 100) / 100}_${Math.round(p.lng * 100) / 100}`;
-      if (!seen.has(k)) { seen.add(k); nextSeeds.push(p); }
+      const key = `${Math.round(p.lat*100)/100}_${Math.round(p.lng*100)/100}`;
+      if (!seen.has(key)) { seen.add(key); nextSeeds.push(p); }
     }
-    seeds = nextSeeds.slice(0, 64); // cap
+    seeds = nextSeeds;
   }
 
-  // smoothing pass
-  let smooth = merged;
+  // smooth corners & final simplify
   try {
-    smooth = turf.buffer(smooth, 3, { units: 'kilometers' });
-    smooth = turf.buffer(smooth, -3, { units: 'kilometers' });
+    merged = turf.buffer(merged, 3, { units: 'kilometers' });
+    merged = turf.buffer(merged, -3, { units: 'kilometers' });
   } catch {}
-  try { smooth = turf.simplify(smooth, { tolerance: 0.01, highQuality: true }); } catch {}
+  merged = turf.simplify(merged, { tolerance: 0.01, highQuality: true });
 
-  return smooth;
+  return merged;
 }
 
-// ---------------- API -------------------
+/* ------------------------------------------------------------------ *
+ * API
+ * ------------------------------------------------------------------ */
 app.get('/range', async (req, res) => {
   try {
+    if (!HERE_KEY) throw new Error('Missing HERE_API_KEY');
+    if (!LAND_FEATURE) throw new Error('Land mask not loaded yet');
+
     const lat = Number(req.query.lat);
     const lng = Number(req.query.lng);
     const miles = Number(req.query.miles);
-    if (!HERE_KEY) throw new Error('Missing HERE_API_KEY');
     if (!isFinite(lat) || !isFinite(lng) || !isFinite(miles)) {
       return res.status(400).json({ error: 'lat,lng,miles required' });
     }
@@ -294,7 +267,6 @@ app.get('/range', async (req, res) => {
     if (hit) return res.json({ cached: true, geojson: hit });
 
     const safeMiles = Math.min(miles, 450);
-
     const t0 = Date.now();
     const feature = await computeStitchedPolygon(lat, lng, safeMiles);
     const ms = Date.now() - t0;
@@ -308,4 +280,7 @@ app.get('/range', async (req, res) => {
 });
 
 app.get('/health', (_, res) => res.send('ok'));
+
+/* Boot: load land mask once, then start server */
+await loadLandMask();
 app.listen(PORT, () => console.log('Server on :' + PORT));
