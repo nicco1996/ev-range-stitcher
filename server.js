@@ -23,7 +23,7 @@ app.use((req, res, next) => {
 // ---------------- Cache (24h) --------
 const cache = new NodeCache({ stdTTL: 60 * 60 * 24, useClones: false });
 
-// ------------- Minimal Flex-Polyline decoder --------------
+// Minimal flexible-polyline decoder (no external package)
 function decodeFlexPolyline(str) {
   if (typeof str !== 'string' || !str.length) return [];
   let i = 0;
@@ -55,41 +55,32 @@ function decodeFlexPolyline(str) {
     lat += svar();
     lng += svar();
     const rec = [lat / factor, lng / factor];
-    if (hasZ) {
-      z += svar();
-      rec.push(z / thirdFactor);
-    }
+    if (hasZ) { z += svar(); rec.push(z / thirdFactor); }
     out.push(rec);
   }
-  return out; // [ [lat,lng,(z?)] ... ]
+  return out; // [[lat,lng,(z)]...]
 }
 
-// ---------------- Helpers ----------------
 function snap(val, gridDeg = 0.1) { return Math.round(val / gridDeg) * gridDeg; }
 function cacheKey(lat, lng, miles, mode = 'car') {
   return `${snap(lat)},${snap(lng)}:${Math.round(miles)}:${mode}`;
 }
 
-// Robust extractor: traverse the whole HERE response and collect any "outer" ring
+// Robust extractor: collect any polygon ring in the HERE payload
 function hereResponseToFeatures(data) {
   const features = [];
 
   const normalizeOuter = (outer) => {
-    // A) Array
     if (Array.isArray(outer)) {
       if (!outer.length) return [];
-      // A1) [{lat,lng}, ...]
       if (typeof outer[0] === 'object' && outer[0] &&
           (('lat' in outer[0]) || ('lng' in outer[0]))) {
         return outer.map(pt => [Number(pt.lng), Number(pt.lat)]);
       }
-      // A2) [[lng,lat], ...]
       if (Array.isArray(outer[0])) {
         return outer.map(pair => [Number(pair[0]), Number(pair[1])]);
       }
     }
-
-    // B) GeoJSON LineString-ish
     if (outer && typeof outer === 'object' &&
         outer.type === 'LineString' &&
         Array.isArray(outer.coordinates)) {
@@ -100,15 +91,12 @@ function hereResponseToFeatures(data) {
         return c.map(pt => [Number(pt.lng), Number(pt.lat)]);
       }
     }
-
-    // C) String flex polyline
     if (typeof outer === 'string') {
       try {
         const coords = decodeFlexPolyline(outer); // [[lat,lng,(z)]...]
         return coords.map(([la, ln]) => [Number(ln), Number(la)]);
       } catch {}
     }
-
     return [];
   };
 
@@ -121,32 +109,24 @@ function hereResponseToFeatures(data) {
     catch { return null; }
   };
 
-  // DFS the whole object; collect anything with 'outer' or 'polygons'
-  const dfs = (obj, depth = 0) => {
+  const dfs = (obj) => {
     if (!obj || typeof obj !== 'object') return;
-
-    // if 'outer' exists, try to normalize it
     if ('outer' in obj) {
       const ring = normalizeOuter(obj.outer);
       const poly = ringToPolygon(ring);
       if (poly) features.push(poly);
     }
-
-    // if 'polygons' array present
     if (Array.isArray(obj.polygons)) {
-      for (const it of obj.polygons) dfs(it, depth + 1);
+      for (const it of obj.polygons) dfs(it);
     }
-
-    // generic recursion
     for (const k of Object.keys(obj)) {
       const v = obj[k];
-      if (Array.isArray(v)) for (const x of v) dfs(x, depth + 1);
-      else if (v && typeof v === 'object') dfs(v, depth + 1);
+      if (Array.isArray(v)) for (const x of v) dfs(x);
+      else if (v && typeof v === 'object') dfs(v);
     }
   };
 
   dfs(data);
-
   if (DEBUG) console.log(`[EXTRACTOR] features found: ${features.length}`);
   return features;
 }
@@ -171,7 +151,6 @@ async function fetchIsoline(lat, lng, stepMeters) {
     console.log('[HERE] keys:', Object.keys(data || {}));
     if (iso0) console.log('[HERE] isolines[0] keys:', Object.keys(iso0));
   }
-
   return data;
 }
 
@@ -187,8 +166,7 @@ function sampleBoundary(feature, n = 80) {
       pts.push({ lat: y, lng: x });
     }
     return pts;
-  } catch (e) {
-    // Very defensive fallback: sample bbox
+  } catch {
     const b = turf.bbox(feature);
     const [minX, minY, maxX, maxY] = b;
     return [
@@ -204,12 +182,21 @@ function unionAll(features) {
   for (let i = 1; i < features.length; i++) {
     try { out = turf.union(out, features[i]) || out; }
     catch {
-      try {
-        out = turf.combine(turf.featureCollection([out, features[i]])).features[0];
-      } catch {}
+      try { out = turf.combine(turf.featureCollection([out, features[i]])).features[0]; }
+      catch {}
     }
   }
   return out;
+}
+
+// ----------- NEW: nudge a point inland toward center by N km -----------
+function nudgeToward(lat, lng, centerLat, centerLng, km = 3) {
+  const from = turf.point([lng, lat]);
+  const to = turf.point([centerLng, centerLat]);
+  const bearing = turf.bearing(from, to);
+  const dest = turf.destination(from, km, bearing, { units: 'kilometers' });
+  const [nx, ny] = dest.geometry.coordinates;
+  return { lat: ny, lng: nx };
 }
 
 // --------------- Stitcher ----------------
@@ -239,24 +226,27 @@ async function computeStitchedPolygon(lat, lng, targetMiles) {
     }
 
     if (!feats.length) {
-      if (DEBUG) {
-        const firstOk = results.find(r => r.status === 'fulfilled')?.value;
-        console.log('[NO POLYS] sample payload:', JSON.stringify(firstOk)?.slice(0, 1500));
-      }
+      // Log one payload to see why
+      const ok = results.find(r => r.status === 'fulfilled')?.value;
+      if (DEBUG) console.log('[NO POLYS] sample payload:', JSON.stringify(ok)?.slice(0, 1500));
       throw new Error('No polygons from HERE at this ring');
     }
 
     merged = merged ? unionAll([merged, ...feats]) : unionAll(feats);
 
-    // simplify as we grow
     try { merged = turf.simplify(merged, { tolerance: 0.01, highQuality: true }); } catch {}
 
-    // new seeds: sample boundary
-    const boundarySeeds = sampleBoundary(merged, 80);
-    const seen = new Set(); const nextSeeds = [];
+    // next seeds: sample boundary, then NUDGE 3 km TOWARD center
+    const boundarySeeds = sampleBoundary(merged, 90);
+    const center = turf.center(merged).geometry.coordinates; // [lng,lat]
+    const [clng, clat] = center;
+
+    const seen = new Set();
+    const nextSeeds = [];
     for (const p of boundarySeeds) {
-      const k = `${Math.round(p.lat*100)/100}_${Math.round(p.lng*100)/100}`;
-      if (!seen.has(k)) { seen.add(k); nextSeeds.push(p); }
+      const nudged = nudgeToward(p.lat, p.lng, clat, clng, 3); // 3 km inward
+      const k = `${Math.round(nudged.lat*100)/100}_${Math.round(nudged.lng*100)/100}`;
+      if (!seen.has(k)) { seen.add(k); nextSeeds.push(nudged); }
     }
     seeds = nextSeeds;
   }
@@ -303,3 +293,4 @@ app.get('/range', async (req, res) => {
 
 app.get('/health', (_, res) => res.send('ok'));
 app.listen(PORT, () => console.log('Server on :' + PORT));
+
