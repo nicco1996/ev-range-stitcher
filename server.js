@@ -8,7 +8,7 @@ import * as turf from '@turf/turf';
 const app = express();
 const PORT = process.env.PORT || 3000;
 const HERE_KEY = process.env.HERE_API_KEY;
-const MAX_CONCURRENCY = Number(process.env.MAX_CONCURRENCY || 20);
+const MAX_CONCURRENCY = Number(process.env.MAX_CONCURRENCY || 18);
 const DEBUG = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
 
 // ---------------- CORS ----------------
@@ -116,9 +116,7 @@ function hereResponseToFeatures(data) {
       const poly = ringToPolygon(ring);
       if (poly) features.push(poly);
     }
-    if (Array.isArray(obj.polygons)) {
-      for (const it of obj.polygons) dfs(it);
-    }
+    if (Array.isArray(obj.polygons)) for (const it of obj.polygons) dfs(it);
     for (const k of Object.keys(obj)) {
       const v = obj[k];
       if (Array.isArray(v)) for (const x of v) dfs(x);
@@ -154,7 +152,7 @@ async function fetchIsoline(lat, lng, stepMeters) {
   return data;
 }
 
-function sampleBoundary(feature, n = 80) {
+function sampleBoundary(feature, n = 60) {
   try {
     const line = turf.polygonToLine(feature);
     const length = turf.length(line, { units: 'kilometers' });
@@ -189,7 +187,7 @@ function unionAll(features) {
   return out;
 }
 
-// ----------- NEW: nudge a point inland toward center by N km -----------
+// ----------- geometry helpers -----------
 function nudgeToward(lat, lng, centerLat, centerLng, km = 3) {
   const from = turf.point([lng, lat]);
   const to = turf.point([centerLng, centerLat]);
@@ -197,6 +195,25 @@ function nudgeToward(lat, lng, centerLat, centerLng, km = 3) {
   const dest = turf.destination(from, km, bearing, { units: 'kilometers' });
   const [nx, ny] = dest.geometry.coordinates;
   return { lat: ny, lng: nx };
+}
+
+// Try HERE multiple times per seed with increasing inland distances
+async function isolineFromSeedWithRetries(seed, center, stepMeters) {
+  const attemptsKm = [0, 3, 6, 10, 15, 25]; // 0 = as-is, then stronger nudges
+  for (const km of attemptsKm) {
+    const p = km === 0 ? seed : nudgeToward(seed.lat, seed.lng, center.lat, center.lng, km);
+    try {
+      const data = await fetchIsoline(p.lat, p.lng, stepMeters);
+      const feats = hereResponseToFeatures(data);
+      if (feats.length) return feats;
+      if (DEBUG && data?.notices?.length) {
+        console.log('[SEED NOTICE]', km, JSON.stringify(data.notices).slice(0, 200));
+      }
+    } catch (e) {
+      if (DEBUG) console.log('[SEED FAIL]', km, e.message);
+    }
+  }
+  return []; // all attempts failed
 }
 
 // --------------- Stitcher ----------------
@@ -212,43 +229,42 @@ async function computeStitchedPolygon(lat, lng, targetMiles) {
   const limit = pLimit(MAX_CONCURRENCY);
 
   for (let ring = 0; ring < iters; ring++) {
-    const jobs = seeds.map(s => limit(() => fetchIsoline(s.lat, s.lng, stepMeters)));
+    // Evaluate all seeds with retry nudges
+    const centroidSeed = { lat: lat, lng: lng }; // fallback center if not merged yet
+    const centerPt = merged
+      ? (() => {
+          const [clng, clat] = turf.center(merged).geometry.coordinates;
+          return { lat: clat, lng: clng };
+        })()
+      : centroidSeed;
+
+    const jobs = seeds.map(s => limit(() => isolineFromSeedWithRetries(s, centerPt, stepMeters)));
     const results = await Promise.allSettled(jobs);
 
     const feats = [];
     for (const r of results) {
-      if (r.status === 'fulfilled') {
-        const f = hereResponseToFeatures(r.value);
-        feats.push(...f);
-      } else if (DEBUG) {
-        console.log('[FETCH FAIL]', r.reason?.message || r.reason);
-      }
+      if (r.status === 'fulfilled' && r.value?.length) feats.push(...r.value);
     }
-
     if (!feats.length) {
-      // Log one payload to see why
-      const ok = results.find(r => r.status === 'fulfilled')?.value;
-      if (DEBUG) console.log('[NO POLYS] sample payload:', JSON.stringify(ok)?.slice(0, 1500));
+      if (DEBUG) {
+        const ok = results.find(r => r.status === 'fulfilled')?.value;
+        console.log('[NO POLYS] all seeds failed on this ring');
+      }
       throw new Error('No polygons from HERE at this ring');
     }
 
     merged = merged ? unionAll([merged, ...feats]) : unionAll(feats);
-
     try { merged = turf.simplify(merged, { tolerance: 0.01, highQuality: true }); } catch {}
 
-    // next seeds: sample boundary, then NUDGE 3 km TOWARD center
-    const boundarySeeds = sampleBoundary(merged, 90);
-    const center = turf.center(merged).geometry.coordinates; // [lng,lat]
-    const [clng, clat] = center;
-
+    // Next seeds from boundary; de-dup coarse; fewer seeds to reduce calls
+    const boundarySeeds = sampleBoundary(merged, 60);
     const seen = new Set();
     const nextSeeds = [];
     for (const p of boundarySeeds) {
-      const nudged = nudgeToward(p.lat, p.lng, clat, clng, 3); // 3 km inward
-      const k = `${Math.round(nudged.lat*100)/100}_${Math.round(nudged.lng*100)/100}`;
-      if (!seen.has(k)) { seen.add(k); nextSeeds.push(nudged); }
+      const k = `${Math.round(p.lat * 100) / 100}_${Math.round(p.lng * 100) / 100}`;
+      if (!seen.has(k)) { seen.add(k); nextSeeds.push(p); }
     }
-    seeds = nextSeeds;
+    seeds = nextSeeds.slice(0, 64); // cap
   }
 
   // smoothing pass
@@ -293,4 +309,3 @@ app.get('/range', async (req, res) => {
 
 app.get('/health', (_, res) => res.send('ok'));
 app.listen(PORT, () => console.log('Server on :' + PORT));
-
