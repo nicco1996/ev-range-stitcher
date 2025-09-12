@@ -12,6 +12,6 @@
     "node-cache": "5.1.2",
     "p-limit": "4.0.0",
     "undici": "6.19.8",
-    "@here/flexpolyline": "1.1.0"
+    "flexible-polyline": "1.0.0"
   }
 }
