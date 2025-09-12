@@ -9,6 +9,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const HERE_KEY = process.env.HERE_API_KEY;
 const MAX_CONCURRENCY = Number(process.env.MAX_CONCURRENCY || 20);
+const DEBUG = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
 
 // ---------------- CORS (allow Bubble/frontend) ----------------
 app.use((req, res, next) => {
@@ -72,8 +73,8 @@ function cacheKey(lat, lng, miles, mode = 'car') {
   return `${snap(lat)},${snap(lng)}:${Math.round(miles)}:${mode}`;
 }
 
-function herePolyToFeatures(isoline) {
-  const polys = isoline?.polygons || [];
+// Walk the whole HERE response and collect any "outer" rings we can decode
+function hereResponseToFeatures(data) {
   const features = [];
 
   function normalizeOuter(outer) {
@@ -90,22 +91,20 @@ function herePolyToFeatures(isoline) {
       }
     }
 
-    // B) GeoJSON-like line object
+    // B) GeoJSON-like LineString
     if (outer && typeof outer === 'object' && outer.type === 'LineString' && Array.isArray(outer.coordinates)) {
       const c = outer.coordinates;
       if (!c.length) return [];
-      if (Array.isArray(c[0])) {
-        return c.map(pair => [Number(pair[0]), Number(pair[1])]); // [[lng,lat],...]
-      }
+      if (Array.isArray(c[0])) return c.map(pair => [Number(pair[0]), Number(pair[1])]); // [[lng,lat],...]
       if (typeof c[0] === 'object' && (('lat' in c[0]) || ('lng' in c[0]))) {
         return c.map(pt => [Number(pt.lng), Number(pt.lat)]);
       }
     }
 
-    // C) HERE flexible polyline string
+    // C) HERE flexible polyline (string)
     if (typeof outer === 'string') {
       try {
-        const coords = decodeFlexPolyline(outer); // [ [lat,lng,(z?)], ... ]
+        const coords = decodeFlexPolyline(outer); // [[lat,lng(,z)], ...]
         return coords.map(([lat, lng]) => [Number(lng), Number(lat)]);
       } catch {
         return [];
@@ -115,18 +114,32 @@ function herePolyToFeatures(isoline) {
     return [];
   }
 
-  for (const p of polys) {
-    const ring = normalizeOuter(p.outer);
-    if (!ring.length) continue;
-
-    // ensure closed ring
+  function ringToPolygon(ring) {
     const [fx, fy] = ring[0];
     const [lx, ly] = ring[ring.length - 1];
     if (fx !== lx || fy !== ly) ring.push([fx, fy]);
-
-    features.push(turf.polygon([ring], {}));
+    return turf.polygon([ring], {});
   }
 
+  // Depth-first search through entire object to find polygons/outer rings
+  function dfs(obj) {
+    if (!obj || typeof obj !== 'object') return;
+
+    if (Array.isArray(obj.polygons)) {
+      for (const poly of obj.polygons) {
+        const ring = normalizeOuter(poly?.outer);
+        if (ring.length) features.push(ringToPolygon(ring));
+      }
+    }
+
+    for (const k of Object.keys(obj)) {
+      const v = obj[k];
+      if (v && typeof v === 'object') dfs(v);
+      if (Array.isArray(v)) for (const it of v) dfs(it);
+    }
+  }
+
+  dfs(data);
   return features;
 }
 
@@ -144,7 +157,15 @@ async function fetchIsoline(lat, lng, stepMeters) {
     throw new Error(`HERE isoline ${res.status}: ${txt}`);
   }
   const data = await res.json();
-  if (!data.isolines || !data.isolines.length) throw new Error('No isolines returned');
+
+  if (DEBUG) {
+    try {
+      console.log('[HERE] keys:', Object.keys(data || {}));
+      const iso0 = data?.isolines?.[0] || null;
+      if (iso0) console.log('[HERE] isolines[0] keys:', Object.keys(iso0));
+    } catch {}
+  }
+
   return data;
 }
 
@@ -167,7 +188,7 @@ function unionAll(features) {
   for (let i = 1; i < features.length; i++) {
     try { out = turf.union(out, features[i]) || out; }
     catch {
-      // fallback if union fails
+      // fallback if union fails (occasionally turf.union throws)
       out = turf.combine(turf.featureCollection([out, features[i]])).features[0];
     }
   }
@@ -193,11 +214,19 @@ async function computeStitchedPolygon(lat, lng, targetMiles) {
     const feats = [];
     for (const r of results) {
       if (r.status === 'fulfilled') {
-        const features = herePolyToFeatures(r.value.isolines[0]);
+        const features = hereResponseToFeatures(r.value);
         feats.push(...features);
       }
     }
-    if (!feats.length) throw new Error('No polygons from HERE at this ring');
+
+    if (!feats.length) {
+      if (DEBUG) {
+        const firstOk = results.find(r => r.status === 'fulfilled')?.value;
+        console.log('[STITCH] Empty feature set; sample HERE payload:',
+          JSON.stringify(firstOk)?.slice(0, 1200));
+      }
+      throw new Error('No polygons from HERE at this ring');
+    }
 
     merged = merged ? unionAll([merged, ...feats]) : unionAll(feats);
 
