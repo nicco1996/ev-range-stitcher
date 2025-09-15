@@ -2,10 +2,9 @@
   "name": "ev-range-stitcher",
   "version": "1.0.0",
   "type": "module",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
+    "@here/flexible-polyline": "^1.0.0",
     "@turf/turf": "6.5.0",
     "dotenv": "16.4.5",
     "express": "4.19.2",
