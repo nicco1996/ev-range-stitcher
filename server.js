@@ -41,11 +41,11 @@ function decodeFlexiblePolyline(str) {
   const MAP = {};
   for (let i = 0; i < TABLE.length; i++) MAP[TABLE[i]] = i;
 
-  function decodeUnsigned(str) {
+  function decodeUnsigned(str2) {
     const out = [];
     let value = 0, shift = 0;
-    for (let i = 0; i < str.length; i++) {
-      const digit = MAP[str[i]];
+    for (let i = 0; i < str2.length; i++) {
+      const digit = MAP[str2[i]];
       value |= (digit & 0x1f) << shift;
       if ((digit & 0x20) === 0) {
         out.push(value);
@@ -74,8 +74,7 @@ function decodeFlexiblePolyline(str) {
 }
 
 // ======================================================
-// HERE response -> GeoJSON features
-// ======================================================
+/** HERE response -> GeoJSON features (decode polygons[].outer) */
 function herePolyToFeatures(isoline) {
   const polys = Array.isArray(isoline?.polygons) ? isoline.polygons : [];
   const feats = [];
@@ -94,7 +93,7 @@ function herePolyToFeatures(isoline) {
       }
     }
 
-    // B) Fallback: GeoJSON-like LineString
+    // B) Fallback: GeoJSON LineString
     if (!ring.length && outer && typeof outer === 'object' && outer.type === 'LineString' && Array.isArray(outer.coordinates)) {
       ring = outer.coordinates.map(([x, y]) => [Number(x), Number(y)]);
     }
@@ -179,6 +178,39 @@ async function snapToRoad(lat, lng) {
 }
 
 // ======================================================
+// Robust ring-0 helpers
+// ======================================================
+async function tryIsolineAt(lat, lng, meters) {
+  try {
+    const j = await fetchIsoline(lat, lng, meters);
+    const features = herePolyToFeatures(j.isolines[0]);
+    return features.length ? features : null;
+  } catch (e) {
+    if (DEBUG) console.log('[tryIsolineAt FAIL]', e?.message);
+    return null;
+  }
+}
+
+// Probe a small grid around origin, snap each, try isoline; return first success
+async function getRoutableSeedForRing0(lat, lng, meters) {
+  // ~0.0009° ≈ 100 m; test 0, ±60 m, ±120 m in both axes
+  const deltas = [0, 0.0006, -0.0006, 0.0012, -0.0012];
+
+  for (const dLat of deltas) {
+    for (const dLng of deltas) {
+      const probe = { lat: lat + dLat, lng: lng + dLng };
+      const snapped = await snapToRoad(probe.lat, probe.lng);
+      const feats = await tryIsolineAt(snapped.lat, snapped.lng, meters);
+      if (feats) {
+        if (DEBUG) console.log('[RING0 SEED] using', snapped);
+        return { snapped, features: feats };
+      }
+    }
+  }
+  return null;
+}
+
+// ======================================================
 // Geometry utils
 // ======================================================
 function unionAll(features) {
@@ -216,26 +248,29 @@ async function computeStitchedPolygon(lat, lng, targetMiles) {
   const STEP_KM = 100; // HERE max distance per isoline
   const stepMeters = Math.round(STEP_KM * 1000);
   const iters = Math.max(1, Math.ceil(targetKm / STEP_KM));
-
-  // Ring 0 — snap center and get first isoline
-  const start = await snapToRoad(lat, lng);
-  const firstResp = await fetchIsoline(start.lat, start.lng, stepMeters);
-  let feats0 = herePolyToFeatures(firstResp.isolines[0]);
-  if (!feats0.length) throw new Error('No polygons from HERE at ring 0');
-
-  let merged = unionAll(feats0);
-  merged = turf.simplify(merged, { tolerance: 0.01, highQuality: true });
-
   const limit = pLimit(MAX_CONCURRENCY);
 
-  // Rings 1..N
+  // --- Ring 0: robust bootstrap
+  const r0 = await getRoutableSeedForRing0(lat, lng, stepMeters);
+  if (!r0) {
+    throw new Error('No isolines returned at ring 0 after probing nearby points');
+  }
+  let merged = unionAll(r0.features);
+  merged = turf.simplify(merged, { tolerance: 0.01, highQuality: true });
+
+  // next ring seeds start from the successful snapped seed
+  let seeds = [r0.snapped];
+
+  // --- Rings 1..N
   for (let ring = 1; ring < iters; ring++) {
-    const seeds = sampleBoundary(merged, 80);
+    const boundary = sampleBoundary(merged, 80);
 
-    // snap seeds to road
-    const snapped = await Promise.allSettled(seeds.map(s => limit(() => snapToRoad(s.lat, s.lng))));
+    // snap seeds to road (in parallel)
+    const snapped = await Promise.allSettled(
+      boundary.map(s => limit(() => snapToRoad(s.lat, s.lng)))
+    );
 
-    // fetch isolines for snapped seeds
+    // fetch isolines for snapped seeds (in parallel)
     const calls = snapped
       .filter(r => r.status === 'fulfilled' && r.value)
       .map(r => r.value)
@@ -248,10 +283,22 @@ async function computeStitchedPolygon(lat, lng, targetMiles) {
     const res = await Promise.all(calls);
     const feats = res.flat().filter(Boolean);
 
-    if (!feats.length) throw new Error(`No polygons from HERE at this ring`);
+    if (!feats.length) {
+      throw new Error(`No polygons from HERE at this ring`);
+    }
 
     merged = unionAll([merged, ...feats]);
     merged = turf.simplify(merged, { tolerance: 0.01, highQuality: true });
+
+    // regenerate seeds for next ring (dedup ~2 decimals)
+    const nextBoundary = sampleBoundary(merged, 80);
+    const seen = new Set();
+    const nextSeeds = [];
+    for (const p of nextBoundary) {
+      const key = `${Math.round(p.lat * 100) / 100}_${Math.round(p.lng * 100) / 100}`;
+      if (!seen.has(key)) { seen.add(key); nextSeeds.push(p); }
+    }
+    seeds = nextSeeds;
   }
 
   // Gentle smoothing to reduce jaggies
@@ -274,9 +321,9 @@ app.get('/diag/here', async (req, res) => {
     const lat = Number(req.query.lat);
     const lng = Number(req.query.lng);
     const meters = Number(req.query.meters || 100000);
-    const snap = await snapToRoad(lat, lng);
-    const j = await fetchIsoline(snap.lat, snap.lng, meters);
-    res.json({ snapped: snap, keys: Object.keys(j || {}), sample: j?.isolines?.[0] });
+    const snapPt = await snapToRoad(lat, lng);
+    const j = await fetchIsoline(snapPt.lat, snapPt.lng, meters);
+    res.json({ snapped: snapPt, keys: Object.keys(j || {}), sample: j?.isolines?.[0] });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
