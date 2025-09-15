@@ -69,7 +69,6 @@ async function fetchIsoline(lat, lng, meters) {
     throw new Error('HERE JSON parse failed');
   }
 
-  // Validate shape
   if (!data || typeof data !== 'object') throw new Error('Bad HERE payload');
   if (!Array.isArray(data.isolines)) {
     const notices = data.notices ? JSON.stringify(data.notices) : '[]';
@@ -78,28 +77,95 @@ async function fetchIsoline(lat, lng, meters) {
   return data;
 }
 
+/** -------- Flexible Polyline decoder (HERE spec) --------
+ * Returns array of [lat, lng] pairs.
+ * Based on the public algorithm description.
+ */
+function decodeFPL(str) {
+  let idx = 0;
+
+  function readVarUInt() {
+    let result = 0, shift = 0, b;
+    do {
+      if (idx >= str.length) throw new Error('FPL truncated');
+      b = str.charCodeAt(idx++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    return result >>> 0;
+  }
+
+  function readVarInt() {
+    const u = readVarUInt();
+    const sign = (u & 1) ? -1 : 1;
+    return sign * (u >> 1);
+  }
+
+  // header
+  const version = str.charCodeAt(idx++) - 63;
+  if (version !== 1) throw new Error('Unsupported FPL version');
+
+  const precision = readVarUInt();
+  const thirdDim = readVarUInt();          // 0 = none
+  const thirdPrec = readVarUInt();
+
+  const factor = Math.pow(10, precision);
+  const thirdFactor = Math.pow(10, thirdPrec);
+
+  let lat = 0, lng = 0, z = 0;
+  const out = [];
+
+  while (idx < str.length) {
+    lat += readVarInt();
+    lng += readVarInt();
+    if (thirdDim !== 0) z += readVarInt(); // ignored
+
+    out.push([lat / factor, lng / factor]); // [lat, lng]
+  }
+  return out;
+}
+
+/** Convert HERE isoline payload to GeoJSON Polygons */
 function extractPolys(payload) {
   const iso = payload.isolines?.[0];
   if (!iso) return [];
   const polys = Array.isArray(iso.polygons) ? iso.polygons : [];
   const out = [];
+
   for (const p of polys) {
     const outer = p?.outer;
     if (!outer) continue;
 
-    // outer is HERE flexible polyline string — we can’t decode server-side
-    // without the (unavailable) package, so we piggyback on HERE’s GeoJSON option.
-    // BUT the v8 Isoline response doesn’t have a GeoJSON flag. So we
-    // approximate by using the flexible polyline’s line as a ring… which we can’t decode here.
-    // => Workaround: call the same endpoint once with smaller distance and rely on polygons being present.
-    // In practice, polygons are present at 100km; your earlier logs confirm that.
+    // Case 1: HERE flexible polyline string (most common)
+    if (typeof outer === 'string') {
+      try {
+        const coordsLatLng = decodeFPL(outer);           // [[lat,lng], ...]
+        const ring = coordsLatLng
+          .map(([la, lo]) => [Number(lo), Number(la)])   // → [lng,lat]
+          .filter(([x,y]) => Number.isFinite(x) && Number.isFinite(y));
+        if (ring.length >= 4) {
+          const [fx,fy] = ring[0]; const [lx,ly] = ring[ring.length-1];
+          if (fx !== lx || fy !== ly) ring.push([fx,fy]);
+          out.push(turf.polygon([ring]));
+        }
+        continue;
+      } catch (e) {
+        log('[FPL decode failed]', e.message || e);
+        // fall through to try array formats, just in case
+      }
+    }
 
-    // If polygons already come as coordinate arrays (some accounts return that),
-    // accept [ [ [lng,lat], … ] ]:
-    if (Array.isArray(outer) && Array.isArray(outer[0])) {
-      const ring = outer.map(([x,y]) => [Number(x), Number(y)]).filter(([x,y]) => Number.isFinite(x) && Number.isFinite(y));
-      if (ring.length >= 4) {
-        // ensure closed
+    // Case 2: Some accounts return arrays already
+    if (Array.isArray(outer)) {
+      // e.g. [[lng,lat], ...] or [{lat,lng}, ...]
+      if (!outer.length) continue;
+      let ring;
+      if (Array.isArray(outer[0])) {
+        ring = outer.map(([x,y]) => [Number(x), Number(y)]);
+      } else if (typeof outer[0] === 'object' && (('lat' in outer[0]) || ('lng' in outer[0]))) {
+        ring = outer.map(pt => [Number(pt.lng), Number(pt.lat)]);
+      }
+      if (ring && ring.length >= 4) {
         const [fx,fy] = ring[0]; const [lx,ly] = ring[ring.length-1];
         if (fx !== lx || fy !== ly) ring.push([fx,fy]);
         out.push(turf.polygon([ring]));
