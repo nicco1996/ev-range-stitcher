@@ -178,10 +178,28 @@ function sampleBoundary(feature, n=60) {
   const pts = [];
   
   for (let i=0;i<n;i++){
-    const p = turf.along(line, i*step, { units:'kilometers' });
-    const [x,y] = p.geometry.coordinates;
-    pts.push({ lat: y, lng: x });
+    try {
+      const p = turf.along(line, i*step, { units:'kilometers' });
+      if (!p || !p.geometry || !p.geometry.coordinates) {
+        console.error('[sampleBoundary] Invalid point at step', i);
+        continue;
+      }
+      const [x,y] = p.geometry.coordinates;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        console.error('[sampleBoundary] Non-finite coordinates at step', i, ':', x, y);
+        continue;
+      }
+      pts.push({ lat: y, lng: x });
+    } catch (e) {
+      console.error('[sampleBoundary] Error at step', i, ':', e.message);
+      continue;
+    }
   }
+  
+  if (pts.length === 0) {
+    throw new Error('No valid sample points generated');
+  }
+  
   return pts;
 }
 
@@ -219,10 +237,17 @@ async function computeStitchedPolygon(lat, lng, miles) {
   }
 
   try {
-    merged = turf.buffer(merged, 2, { units:'kilometers' });
-    merged = turf.buffer(merged, -2, { units:'kilometers' });
-    merged = turf.simplify(merged, { tolerance: 0.01, highQuality: true });
-  } catch {}
+    // Morphological closing - can fail on complex geometries
+    const buffered = turf.buffer(merged, 2, { units:'kilometers' });
+    if (buffered && buffered.geometry && buffered.geometry.coordinates) {
+      const debuffered = turf.buffer(buffered, -2, { units:'kilometers' });
+      if (debuffered && debuffered.geometry && debuffered.geometry.coordinates) {
+        merged = turf.simplify(debuffered, { tolerance: 0.01, highQuality: true });
+      }
+    }
+  } catch (e) {
+    console.log('[COMPUTE] Buffer operation failed, using unsmoothened geometry:', e.message);
+  }
 
   return merged;
 }
