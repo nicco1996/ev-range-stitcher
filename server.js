@@ -150,10 +150,33 @@ function unionAll(features) {
 }
 
 function sampleBoundary(feature, n=60) {
-  const line = turf.polygonToLine(feature);
+  // Ensure we have a proper feature object
+  if (!feature || !feature.geometry) {
+    console.error('[sampleBoundary] Invalid feature:', feature);
+    throw new Error('Invalid feature for sampleBoundary');
+  }
+  
+  const lineResult = turf.polygonToLine(feature);
+  
+  // polygonToLine can return either a Feature or FeatureCollection
+  // If MultiPolygon, it returns a FeatureCollection
+  let line;
+  if (lineResult.type === 'FeatureCollection') {
+    // Use the first line from the collection (outer boundary)
+    line = lineResult.features[0];
+  } else {
+    line = lineResult;
+  }
+  
+  if (!line || !line.geometry) {
+    console.error('[sampleBoundary] No valid line geometry:', lineResult);
+    throw new Error('Failed to convert polygon to line');
+  }
+  
   const len = turf.length(line, { units:'kilometers' });
   const step = len / n;
   const pts = [];
+  
   for (let i=0;i<n;i++){
     const p = turf.along(line, i*step, { units:'kilometers' });
     const [x,y] = p.geometry.coordinates;
