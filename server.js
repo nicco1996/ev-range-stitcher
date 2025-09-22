@@ -87,9 +87,9 @@ function decodeFPL(str) {
   function readVarUInt() {
     let result = 0, shift = 0, b;
     do {
-      if (idx >= str.length) throw new Error('FPL truncated at readVarUInt');
-      b = str.charCodeAt(idx++) - 63;
-      if (b < 0) throw new Error('Invalid char in FPL');
+      if (idx >= str.length) throw new Error('FPL truncated at index ' + idx);
+      const charCode = str.charCodeAt(idx++);
+      b = charCode - 63;
       result |= (b & 0x1f) << shift;
       shift += 5;
     } while (b >= 0x20);
@@ -98,34 +98,28 @@ function decodeFPL(str) {
 
   function readVarInt() {
     const u = readVarUInt();
-    const sign = (u & 1) ? -1 : 1;
-    return sign * (u >>> 1);
+    return (u & 1) ? ~(u >>> 1) : (u >>> 1);
   }
 
   // Header
   if (idx >= str.length) throw new Error('Empty FPL string');
   const version = str.charCodeAt(idx++) - 63;
   
-  if (idx >= str.length) throw new Error('FPL too short for header');
   const precision = readVarUInt();
   const thirdDim = readVarUInt();
   const thirdPrec = readVarUInt();
 
   const factor = Math.pow(10, precision);
-  const thirdFactor = Math.pow(10, thirdPrec);
 
   let lat = 0, lng = 0, z = 0;
   const out = [];
 
   while (idx < str.length) {
-    const dlat = readVarInt();
-    const dlng = readVarInt();
-    lat += dlat;
-    lng += dlng;
+    lat += readVarInt();
+    lng += readVarInt();
     
     if (thirdDim !== 0) {
-      const dz = readVarInt();
-      z += dz;
+      z += readVarInt();
     }
 
     out.push([lat / factor, lng / factor]);
