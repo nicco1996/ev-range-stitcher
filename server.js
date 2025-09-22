@@ -84,8 +84,8 @@ async function fetchIsoline(lat, lng, meters) {
 function decodeFPL(str) {
   let idx = 0;
 
-  function readVarUInt() {
-    let result = 0;
+  function decode1() {
+    let res = 0;
     let shift = 0;
     let b;
     
@@ -94,28 +94,23 @@ function decodeFPL(str) {
         throw new Error(`FPL truncated at index ${idx}`);
       }
       b = str.charCodeAt(idx++) - 63;
-      result |= (b & 0x1f) << shift;
+      res |= (b & 0x1f) << shift;
       shift += 5;
     } while (b >= 0x20);
     
-    return result;
-  }
-
-  function readVarInt() {
-    const u = readVarUInt();
-    return (u & 1) ? -(u >> 1) - 1 : (u >> 1);
+    // Handle negative numbers
+    return (res & 1) ? ~(res >> 1) : (res >> 1);
   }
 
   // Read header
   if (!str || str.length === 0) throw new Error('Empty FPL string');
   
   const header = str.charCodeAt(idx++) - 63;
-  const precision = readVarUInt();
-  const thirdDim = readVarUInt();
-  const thirdDimPrecision = readVarUInt();
+  const precision = decode1() + 1;  // Precision is stored as value-1
+  const thirdDim = decode1();
+  const thirdDimPrecision = decode1() + 1;
 
   const factor = Math.pow(10, precision);
-  const thirdFactor = Math.pow(10, thirdDimPrecision);
 
   let lat = 0;
   let lng = 0;
@@ -123,11 +118,11 @@ function decodeFPL(str) {
   const coords = [];
 
   while (idx < str.length) {
-    lat += readVarInt();
-    lng += readVarInt();
+    lat += decode1();
+    lng += decode1();
     
-    if (thirdDim) {
-      z += readVarInt();
+    if (thirdDim !== 0) {
+      z += decode1();
     }
 
     coords.push([lat / factor, lng / factor]);
