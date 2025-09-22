@@ -325,19 +325,38 @@ app.get('/diag/raw-here', async (req,res)=>{
   }
 });
 
-// Test FPL decoder
+// Test FPL decoder - Debug version
 app.get('/diag/decode', (req,res)=>{
   const sample = "BG-m3ztC5i8kvE2uV001B-rgC2uV4vhIA-rgC1uVo9qBn9qBq9qBAy61Cy61C2uV-rgC1uV-rgCn9qBq9qB1uV8rgC2uV-rgCo9qBAq9qBn9qBq9qBA83gE83gEo9qBAq9qBp9qB-rgCzuV";
-  try {
-    const coords = decodeFPL(sample);
-    res.json({ success: true, coordCount: coords.length, sample: coords.slice(0,5) });
-  } catch (e) {
-    res.status(500).json({ 
-      error: e.message || String(e),
-      sampleLength: sample.length,
-      sampleChars: sample.split('').map((c,i) => ({ i, c, code: c.charCodeAt(0) })).slice(140, 150)
-    });
+  
+  // Manual decode to debug
+  let idx = 0;
+  const header = sample.charCodeAt(idx++) - 63;
+  
+  function readVarUInt() {
+    let result = 0, shift = 0, b;
+    do {
+      if (idx >= sample.length) return null;
+      b = sample.charCodeAt(idx++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    return result;
   }
+  
+  const precision = readVarUInt();
+  const thirdDim = readVarUInt();
+  const thirdDimPrecision = readVarUInt();
+  
+  res.json({ 
+    header,
+    precision,
+    thirdDim,
+    thirdDimPrecision,
+    indexAfterHeader: idx,
+    remaining: sample.length - idx,
+    hasThirdDimension: thirdDim !== 0
+  });
 });
 
 // ----------------- API -----------------
