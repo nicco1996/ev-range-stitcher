@@ -85,47 +85,55 @@ function decodeFPL(str) {
   let idx = 0;
 
   function readVarUInt() {
-    let result = 0, shift = 0, b;
+    let result = 0;
+    let shift = 0;
+    let b;
+    
     do {
-      if (idx >= str.length) throw new Error('FPL truncated at index ' + idx);
-      const charCode = str.charCodeAt(idx++);
-      b = charCode - 63;
+      if (idx >= str.length) {
+        throw new Error(`FPL truncated at index ${idx}`);
+      }
+      b = str.charCodeAt(idx++) - 63;
       result |= (b & 0x1f) << shift;
       shift += 5;
     } while (b >= 0x20);
-    return result >>> 0;
+    
+    return result;
   }
 
   function readVarInt() {
     const u = readVarUInt();
-    return (u & 1) ? ~(u >>> 1) : (u >>> 1);
+    return (u & 1) ? -(u >> 1) - 1 : (u >> 1);
   }
 
-  // Header
-  if (idx >= str.length) throw new Error('Empty FPL string');
-  const version = str.charCodeAt(idx++) - 63;
+  // Read header
+  if (!str || str.length === 0) throw new Error('Empty FPL string');
   
+  const header = str.charCodeAt(idx++) - 63;
   const precision = readVarUInt();
   const thirdDim = readVarUInt();
-  const thirdPrec = readVarUInt();
+  const thirdDimPrecision = readVarUInt();
 
   const factor = Math.pow(10, precision);
+  const thirdFactor = Math.pow(10, thirdDimPrecision);
 
-  let lat = 0, lng = 0, z = 0;
-  const out = [];
+  let lat = 0;
+  let lng = 0;
+  let z = 0;
+  const coords = [];
 
   while (idx < str.length) {
     lat += readVarInt();
     lng += readVarInt();
     
-    if (thirdDim !== 0) {
+    if (thirdDim) {
       z += readVarInt();
     }
 
-    out.push([lat / factor, lng / factor]);
+    coords.push([lat / factor, lng / factor]);
   }
-  
-  return out;
+
+  return coords;
 }
 
 function extractPolys(payload) {
@@ -324,7 +332,11 @@ app.get('/diag/decode', (req,res)=>{
     const coords = decodeFPL(sample);
     res.json({ success: true, coordCount: coords.length, sample: coords.slice(0,5) });
   } catch (e) {
-    res.status(500).json({ error: e.message || String(e) });
+    res.status(500).json({ 
+      error: e.message || String(e),
+      sampleLength: sample.length,
+      sampleChars: sample.split('').map((c,i) => ({ i, c, code: c.charCodeAt(0) })).slice(140, 150)
+    });
   }
 });
 
