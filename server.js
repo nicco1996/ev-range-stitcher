@@ -7,6 +7,7 @@ import * as dns from 'node:dns/promises';
 import * as turf from '@turf/turf';
 import pLimit from 'p-limit';
 import NodeCache from 'node-cache';
+import { decode as decodeFPL } from '@here/flexpolyline';
 
 console.log('[STARTUP] All imports successful');
 
@@ -81,56 +82,6 @@ async function fetchIsoline(lat, lng, meters) {
   return data;
 }
 
-function decodeFPL(str) {
-  let idx = 0;
-
-  function decode1() {
-    let res = 0;
-    let shift = 0;
-    let b;
-    
-    do {
-      if (idx >= str.length) {
-        throw new Error(`FPL truncated at index ${idx}`);
-      }
-      b = str.charCodeAt(idx++) - 63;
-      res |= (b & 0x1f) << shift;
-      shift += 5;
-    } while (b >= 0x20);
-    
-    // Handle negative numbers
-    return (res & 1) ? ~(res >> 1) : (res >> 1);
-  }
-
-  // Read header
-  if (!str || str.length === 0) throw new Error('Empty FPL string');
-  
-  const header = str.charCodeAt(idx++) - 63;
-  const precision = decode1() + 1;  // Precision is stored as value-1
-  const thirdDim = decode1();
-  const thirdDimPrecision = decode1() + 1;
-
-  const factor = Math.pow(10, precision);
-
-  let lat = 0;
-  let lng = 0;
-  let z = 0;
-  const coords = [];
-
-  while (idx < str.length) {
-    lat += decode1();
-    lng += decode1();
-    
-    if (thirdDim !== 0) {
-      z += decode1();
-    }
-
-    coords.push([lat / factor, lng / factor]);
-  }
-
-  return coords;
-}
-
 function extractPolys(payload) {
   const iso = payload.isolines?.[0];
   if (!iso) return [];
@@ -143,19 +94,23 @@ function extractPolys(payload) {
 
     if (typeof outer === 'string') {
       try {
-        const coordsLatLng = decodeFPL(outer);
+        // Use HERE's official decoder
+        const decoded = decodeFPL(outer);
+        const coordsLatLng = decoded.polyline;
+        
         const ring = coordsLatLng
           .map(([la, lo]) => [Number(lo), Number(la)])
           .filter(([x,y]) => Number.isFinite(x) && Number.isFinite(y));
+        
         if (ring.length >= 4) {
-          const [fx,fy] = ring[0]; const [lx,ly] = ring[ring.length-1];
+          const [fx,fy] = ring[0]; 
+          const [lx,ly] = ring[ring.length-1];
           if (fx !== lx || fy !== ly) ring.push([fx,fy]);
           out.push(turf.polygon([ring]));
         }
         continue;
       } catch (e) {
         log('[FPL decode failed]', e.message || e);
-        // Don't throw, just skip this polygon
         continue;
       }
     }
@@ -226,7 +181,7 @@ async function computeStitchedPolygon(lat, lng, miles) {
     const feats = batches.flat().filter(Boolean);
     if (!feats.length) {
       log(`[WARNING] No polygons from HERE at ring ${ring}, continuing anyway`);
-      continue; // Continue instead of throwing
+      continue;
     }
 
     merged = unionAll([merged, ...feats].filter(Boolean));
@@ -320,22 +275,23 @@ app.get('/diag/raw-here', async (req,res)=>{
   }
 });
 
-// Test FPL decoder - Debug version
+// Test FPL decoder using official library
 app.get('/diag/decode', (req,res)=>{
   const sample = "BG-m3ztC5i8kvE2uV001B-rgC2uV4vhIA-rgC1uVo9qBn9qBq9qBAy61Cy61C2uV-rgC1uV-rgCn9qBq9qB1uV8rgC2uV-rgCo9qBAq9qBn9qBq9qBA83gE83gEo9qBAq9qBp9qB-rgCzuV";
   
   try {
-    const coords = decodeFPL(sample);
+    const decoded = decodeFPL(sample);
     res.json({ 
       success: true, 
-      coordCount: coords.length, 
-      firstCoords: coords.slice(0, 3),
-      lastCoords: coords.slice(-3)
+      coordCount: decoded.polyline.length, 
+      firstCoords: decoded.polyline.slice(0, 3),
+      lastCoords: decoded.polyline.slice(-3),
+      precision: decoded.precision
     });
   } catch (e) {
     res.status(500).json({ 
       error: e.message || String(e),
-      sampleLength: sample.length
+      stack: e.stack
     });
   }
 });
