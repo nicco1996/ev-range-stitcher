@@ -340,7 +340,7 @@ app.get('/range', async (req,res)=>{
     const lat = Number(req.query.lat);
     const lng = Number(req.query.lng);
     const miles = Number(req.query.miles);
-    if (!isFinite(lat) || !isFinite(lng) || !isfinite(miles)) return res.status(400).json({ error:'lat,lng,miles required' });
+    if (!isFinite(lat) || !isFinite(lng) || !isFinite(miles)) return res.status(400).json({ error:'lat,lng,miles required' });
 
     const key = `${lat.toFixed(3)},${lng.toFixed(3)}:${Math.round(miles)}`;
     const hit = cache.get(key);
