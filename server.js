@@ -96,7 +96,13 @@ function extractPolys(payload) {
       try {
         // Use HERE's official decoder
         const decoded = decodeFPL(outer);
-        const coordsLatLng = decoded.polyline;
+        const coordsLatLng = decoded.polyline || decoded;
+        
+        // Handle if it's not an array
+        if (!Array.isArray(coordsLatLng)) {
+          log('[FPL decode] Unexpected format:', typeof coordsLatLng);
+          continue;
+        }
         
         const ring = coordsLatLng
           .map(([la, lo]) => [Number(lo), Number(la)])
@@ -181,7 +187,7 @@ async function computeStitchedPolygon(lat, lng, miles) {
     const feats = batches.flat().filter(Boolean);
     if (!feats.length) {
       log(`[WARNING] No polygons from HERE at ring ${ring}, continuing anyway`);
-      continue;
+      continue; // Continue instead of throwing
     }
 
     merged = unionAll([merged, ...feats].filter(Boolean));
@@ -308,11 +314,14 @@ app.get('/range', async (req,res)=>{
     const hit = cache.get(key);
     if (hit) return res.json({ cached:true, geojson: hit });
 
+    console.log('[RANGE] Starting computation for', { lat, lng, miles });
     const feat = await computeStitchedPolygon(lat, lng, miles);
+    console.log('[RANGE] Computation complete');
     cache.set(key, feat);
     res.json({ cached:false, geojson: feat });
   } catch (e) {
-    res.status(500).json({ error: e.message || String(e) });
+    console.error('[RANGE ERROR]', e);
+    res.status(500).json({ error: e.message || String(e), stack: e.stack });
   }
 });
 
