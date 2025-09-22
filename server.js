@@ -87,8 +87,9 @@ function decodeFPL(str) {
   function readVarUInt() {
     let result = 0, shift = 0, b;
     do {
-      if (idx >= str.length) throw new Error('FPL truncated');
+      if (idx >= str.length) throw new Error('FPL truncated at readVarUInt');
       b = str.charCodeAt(idx++) - 63;
+      if (b < 0) throw new Error('Invalid char in FPL');
       result |= (b & 0x1f) << shift;
       shift += 5;
     } while (b >= 0x20);
@@ -98,12 +99,14 @@ function decodeFPL(str) {
   function readVarInt() {
     const u = readVarUInt();
     const sign = (u & 1) ? -1 : 1;
-    return sign * (u >> 1);
+    return sign * (u >>> 1);
   }
 
+  // Header
+  if (idx >= str.length) throw new Error('Empty FPL string');
   const version = str.charCodeAt(idx++) - 63;
-  // Accept any version
   
+  if (idx >= str.length) throw new Error('FPL too short for header');
   const precision = readVarUInt();
   const thirdDim = readVarUInt();
   const thirdPrec = readVarUInt();
@@ -115,12 +118,19 @@ function decodeFPL(str) {
   const out = [];
 
   while (idx < str.length) {
-    lat += readVarInt();
-    lng += readVarInt();
-    if (thirdDim !== 0) z += readVarInt();
+    const dlat = readVarInt();
+    const dlng = readVarInt();
+    lat += dlat;
+    lng += dlng;
+    
+    if (thirdDim !== 0) {
+      const dz = readVarInt();
+      z += dz;
+    }
 
     out.push([lat / factor, lng / factor]);
   }
+  
   return out;
 }
 
@@ -148,6 +158,8 @@ function extractPolys(payload) {
         continue;
       } catch (e) {
         log('[FPL decode failed]', e.message || e);
+        // Don't throw, just skip this polygon
+        continue;
       }
     }
 
@@ -215,7 +227,10 @@ async function computeStitchedPolygon(lat, lng, miles) {
     ));
     const batches = await Promise.all(jobs);
     const feats = batches.flat().filter(Boolean);
-    if (!feats.length) throw new Error(`No polygons from HERE at ring ${ring}`);
+    if (!feats.length) {
+      log(`[WARNING] No polygons from HERE at ring ${ring}, continuing anyway`);
+      continue; // Continue instead of throwing
+    }
 
     merged = unionAll([merged, ...feats].filter(Boolean));
     merged = turf.simplify(merged, { tolerance: 0.01, highQuality: true });
@@ -308,13 +323,24 @@ app.get('/diag/raw-here', async (req,res)=>{
   }
 });
 
+// Test FPL decoder
+app.get('/diag/decode', (req,res)=>{
+  const sample = "BG-m3ztC5i8kvE2uV001B-rgC2uV4vhIA-rgC1uVo9qBn9qBq9qBAy61Cy61C2uV-rgC1uV-rgCn9qBq9qB1uV8rgC2uV-rgCo9qBAq9qBn9qBq9qBA83gE83gEo9qBAq9qBp9qB-rgCzuV";
+  try {
+    const coords = decodeFPL(sample);
+    res.json({ success: true, coordCount: coords.length, sample: coords.slice(0,5) });
+  } catch (e) {
+    res.status(500).json({ error: e.message || String(e) });
+  }
+});
+
 // ----------------- API -----------------
 app.get('/range', async (req,res)=>{
   try {
     const lat = Number(req.query.lat);
     const lng = Number(req.query.lng);
     const miles = Number(req.query.miles);
-    if (!isFinite(lat) || !isFinite(lng) || !isFinite(miles)) return res.status(400).json({ error:'lat,lng,miles required' });
+    if (!isFinite(lat) || !isFinite(lng) || !isfinite(miles)) return res.status(400).json({ error:'lat,lng,miles required' });
 
     const key = `${lat.toFixed(3)},${lng.toFixed(3)}:${Math.round(miles)}`;
     const hit = cache.get(key);
